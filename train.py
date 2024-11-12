@@ -136,7 +136,7 @@ def main_function():
 
     if args.wandb:
         wandb.init(
-            entity='entity',
+            entity='',
             settings=wandb.Settings(start_method="fork"),
             project=args.project,
             name=args.run_name,

@@ -15,6 +15,7 @@ from torch_geometric.data import Dataset, HeteroData
 from torch_geometric.loader import DataLoader, DataListLoader
 from torch_geometric.transforms import BaseTransform
 from tqdm import tqdm
+from joblib import Parallel, delayed
 
 from datasets.process_mols import read_molecule, get_rec_graph, generate_conformer, \
     get_lig_graph_with_matching, extract_receptor_structure, parse_receptor, parse_pdb_from_path
@@ -59,7 +60,7 @@ class PDBBind(Dataset):
                  receptor_radius=30, num_workers=1, c_alpha_max_neighbors=None, popsize=15, maxiter=15,
                  matching=True, keep_original=False, max_lig_size=None, remove_hs=False, num_conformers=1, all_atoms=False,
                  atom_radius=5, atom_max_neighbors=None, esm_embeddings_path=None, require_ligand=False,
-                 ligands_list=None, protein_path_list=None, ligand_descriptions=None, keep_local_structures=False):
+                 ligands_list=None, protein_path_list=None, ligand_descriptions=None, keep_local_structures=False, cache_individual=True, multiplicity=1):
 
         super(PDBBind, self).__init__(root, transform)
         self.pdbbind_dir = root
@@ -88,6 +89,8 @@ class PDBBind(Dataset):
                                             + ('' if self.esm_embeddings_path is None else f'_esmEmbeddings')
                                             + ('' if not keep_local_structures else f'_keptLocalStruct')
                                             + ('' if protein_path_list is None or ligand_descriptions is None else str(binascii.crc32(''.join(ligand_descriptions + protein_path_list).encode()))))
+        self.cache_individual = cache_individual
+        self.multiplicity = multiplicity
         self.popsize, self.maxiter = popsize, maxiter
         self.matching, self.keep_original = matching, keep_original
         self.num_conformers = num_conformers
@@ -101,25 +104,132 @@ class PDBBind(Dataset):
             else:
                 self.inference_preprocessing()
 
-        print('loading data from memory: ', os.path.join(self.full_cache_path, "heterographs.pkl"))
-        with open(os.path.join(self.full_cache_path, "heterographs.pkl"), 'rb') as f:
-            self.complex_graphs = pickle.load(f)
-        if require_ligand:
-            with open(os.path.join(self.full_cache_path, "rdkit_ligands.pkl"), 'rb') as f:
-                self.rdkit_ligands = pickle.load(f)
+        if not self.cache_individual:
+            print('loading data from memory: ', os.path.join(self.full_cache_path, "heterographs.pkl"))
+            with open(os.path.join(self.full_cache_path, "heterographs.pkl"), 'rb') as f:
+                self.complex_graphs = pickle.load(f)
+            if self.limit_complexes is not None and self.limit_complexes > 0:
+                self.complex_graphs = self.complex_graphs[:self.limit_complexes]
+            if self.require_ligand:
+                with open(os.path.join(self.full_cache_path, "rdkit_ligands.pkl"), 'rb') as f:
+                    self.rdkit_ligands = pickle.load(f)
+        else:
+            print(f'Loading each complex individually from: {self.full_cache_path}', flush=True)
+            print(flush=True)
+            with open(f'{self.full_cache_path}/complex_names.pkl', 'rb') as f:
+                self.complex_names = pickle.load(f)
+            self.complex_files = [
+                f'heterograph-{name}' for name in self.complex_names
+                if os.path.exists(f'{self.full_cache_path}/heterograph-{name}.pt')
+            ]
+            self.complex_graphs = []
+            for i, _ in enumerate(self.complex_files):
+                self.complex_graphs.append(self.get(i))
 
         print_statistics(self.complex_graphs)
 
     def len(self):
-        return len(self.complex_graphs)
-
-    def get(self, idx):
-        if self.require_ligand:
-            complex_graph = copy.deepcopy(self.complex_graphs[idx])
-            complex_graph.mol = copy.deepcopy(self.rdkit_ligands[idx])
-            return complex_graph
+        if self.cache_individual:
+            return len(self.complex_files) * self.multiplicity
         else:
-            return copy.deepcopy(self.complex_graphs[idx])
+            return len(self.complex_graphs) * self.multiplicity
+        
+    # def get(self, idx):
+    #     if self.require_ligand:
+    #         complex_graph = copy.deepcopy(self.complex_graphs[idx])
+    #         complex_graph.mol = copy.deepcopy(self.rdkit_ligands[idx])
+    #         return complex_graph
+    #     else:
+    #         return copy.deepcopy(self.complex_graphs[idx])
+        
+    def get(self, idx):
+        if self.cache_individual:
+            if self.multiplicity:
+                idx = idx % len(self.complex_files)
+            name = self.complex_files[idx]
+            complex_graph = torch.load(f'{self.full_cache_path}/{name}.pt')
+            if self.require_ligand:
+                 name_without_hetero = "-".join(name.split(".")[0].split("-")[1:])
+                 try:
+                     with open(f'{self.full_cache_path}/rdkit_ligand-{name_without_hetero}.pkl', 'rb') as f:
+                         mol = pickle.load(f)
+                         complex_graph.mol = copy.deepcopy(mol)
+                 except Exception as e:
+                     print(f'Complex={name} mol loading failed with {e}. Setting to None')
+                     complex_graph.mol = ''
+        else:
+            if self.multiplicity:
+                idx = idx % len(self.complex_graphs)
+            if self.require_ligand:
+                complex_graph = copy.deepcopy(self.complex_graphs[idx])
+                # This is buggy since the wrong ligand can be fetched.
+                try:
+                    complex_graph.mol = copy.deepcopy(self.rdkit_ligands[idx])
+                except Exception as e:
+                    complex_graph.mol = ''
+            else:
+                complex_graph = copy.deepcopy(self.complex_graphs[idx])
+        return complex_graph
+
+    def load_lm_embeddings(self, complex_names):
+        if self.esm_embeddings_path is None:
+            return {name: None for name in complex_names}
+        if not self.cache_individual:
+            id_to_embeddings = torch.load(self.esm_embeddings_path)
+            chain_embeddings_dictlist = defaultdict(list)
+            for key, embedding in id_to_embeddings.items():
+                key_name = key.split('_')[0]
+                if key_name in complex_names:
+                    chain_embeddings_dictlist[key_name].append(embedding)
+            lm_embeddings_chains_all = {}
+            for name in complex_names:
+                lm_embeddings_chains_all[name] = chain_embeddings_dictlist[name]
+            return lm_embeddings_chains_all
+
+    def fetch_lm_embeddings(self, complex_names):
+        if self.esm_embeddings_path is None:
+            return [None] * len(complex_names)
+        if not self.cache_individual:
+            return [self.lm_embeddings[name] for name in complex_names]
+        else:
+            lm_embeddings_chains = []
+            for name in complex_names:
+                if not os.path.exists(f'{self.esm_embeddings_path}/{name}.pt'):
+                    lm_embeddings_chains.append(None)
+                else:
+                    lm_embeddings = torch.load(f'{self.esm_embeddings_path}/{name}.pt')
+                    chain_idx_sorted = sorted(list(lm_embeddings.keys()))
+                    sorted_chains = [lm_embeddings[idx] for idx in chain_idx_sorted]
+                    lm_embeddings_chains.append(sorted_chains)
+            return lm_embeddings_chains
+
+    def process_complex_dict(self, complex_dict):
+        try:
+            t = self.get_complex([
+                complex_dict['name'], 
+                complex_dict['lm_embedding'],
+                complex_dict['ligand'],
+                complex_dict['ligand_desc']
+            ])
+        except Exception as e:
+            print(f'processing {complex_dict["name"]} failed due to [ERROR]: {e}', flush=True)
+            print(f'skipping {complex_dict["name"]}')
+            return None
+        
+        if self.cache_individual:
+            try:
+                assert len(t) == 3, 'complex, ligands and names must be returned'
+                n_ligands_in_complex = len(t[0])
+                for ligand_id in range(n_ligands_in_complex):
+                    complex_graph = t[0][ligand_id]
+                    ligand = t[1][ligand_id]
+                    name = t[2][ligand_id]
+                    torch.save(complex_graph, f'{self.full_cache_path}/heterograph-{name}.pt')
+                    with open(f'{self.full_cache_path}/rdkit_ligand-{name}.pkl', 'wb') as f:
+                        pickle.dump((ligand), f)
+            except Exception as e:
+                print(f'[ERROR]: {e}', flush=True)
+        return t
 
     def preprocessing(self):
         print(f'Processing complexes from [{self.split_path}] and saving it to [{self.full_cache_path}]')
@@ -129,43 +239,44 @@ class PDBBind(Dataset):
             complex_names_all = complex_names_all[:self.limit_complexes]
         print(f'Loading {len(complex_names_all)} complexes.')
 
-        if self.esm_embeddings_path is not None:
-            id_to_embeddings = torch.load(self.esm_embeddings_path)
-            chain_embeddings_dictlist = defaultdict(list)
-            for key, embedding in id_to_embeddings.items():
-                key_name = key.split('_')[0]
-                if key_name in complex_names_all:
-                    chain_embeddings_dictlist[key_name].append(embedding)
-            lm_embeddings_chains_all = []
-            for name in complex_names_all:
-                lm_embeddings_chains_all.append(chain_embeddings_dictlist[name])
-        else:
-            lm_embeddings_chains_all = [None] * len(complex_names_all)
+        if not self.cache_individual:
+            self.lm_embeddings = self.load_lm_embeddings(complex_names=complex_names_all)
 
-        if self.num_workers > 1:
-            # running preprocessing in parallel on multiple workers and saving the progress every 1000 complexes
-            for i in range(len(complex_names_all)//1000+1):
-                if os.path.exists(os.path.join(self.full_cache_path, f"heterographs{i}.pkl")):
-                    continue
-                complex_names = complex_names_all[1000*i:1000*(i+1)]
-                lm_embeddings_chains = lm_embeddings_chains_all[1000*i:1000*(i+1)]
-                complex_graphs, rdkit_ligands = [], []
-                if self.num_workers > 1:
-                    p = Pool(self.num_workers, maxtasksperchild=1)
-                    p.__enter__()
-                with tqdm(total=len(complex_names), desc=f'loading complexes {i}/{len(complex_names_all)//1000+1}') as pbar:
-                    map_fn = p.imap_unordered if self.num_workers > 1 else map
-                    for t in map_fn(self.get_complex, zip(complex_names, lm_embeddings_chains, [None] * len(complex_names), [None] * len(complex_names))):
-                        complex_graphs.extend(t[0])
-                        rdkit_ligands.extend(t[1])
-                        pbar.update()
-                if self.num_workers > 1: p.__exit__(None, None, None)
+        processed_names = []
 
+        for i in range(len(complex_names_all)//1000+1):
+            if not self.cache_individual and os.path.exists(os.path.join(self.full_cache_path, f"heterographs{i}.pkl")):
+                continue
+            complex_names = complex_names_all[1000*i:1000*(i+1)]
+            complex_graphs, rdkit_ligands = [], []
+            with tqdm(total=len(complex_names), desc=f'loading complexes {i}/{len(complex_names_all)//1000+1}') as pbar:
+                lm_embeddings = self.fetch_lm_embeddings(complex_names=complex_names)
+                complex_dicts = [{
+                    'name': complex_name,
+                    'lm_embedding': lm_embeddings[idx],
+                    'ligand': None,
+                    'ligand_desc': None,
+                } for idx, complex_name in enumerate(complex_names)]
+                results = Parallel(n_jobs=self.num_workers)(
+                    delayed(self.process_complex_dict)(complex_dict) for complex_dict in complex_dicts
+                )
+
+                for result in results:
+                    if result is not None:
+                        if self.cache_individual:
+                            processed_names.extend([graph['name'] for graph in result[0]])
+                        else:
+                            complex_graphs.extend(result[0])
+                            rdkit_ligands.extend(result[1])
+                    pbar.update(len(complex_names))
+
+            if not self.cache_individual:
                 with open(os.path.join(self.full_cache_path, f"heterographs{i}.pkl"), 'wb') as f:
                     pickle.dump((complex_graphs), f)
                 with open(os.path.join(self.full_cache_path, f"rdkit_ligands{i}.pkl"), 'wb') as f:
                     pickle.dump((rdkit_ligands), f)
 
+        if not self.cache_individual:
             complex_graphs_all = []
             for i in range(len(complex_names_all)//1000+1):
                 with open(os.path.join(self.full_cache_path, f"heterographs{i}.pkl"), 'rb') as f:
@@ -182,16 +293,8 @@ class PDBBind(Dataset):
             with open(os.path.join(self.full_cache_path, f"rdkit_ligands.pkl"), 'wb') as f:
                 pickle.dump((rdkit_ligands_all), f)
         else:
-            complex_graphs, rdkit_ligands = [], []
-            with tqdm(total=len(complex_names_all), desc='loading complexes') as pbar:
-                for t in map(self.get_complex, zip(complex_names_all, lm_embeddings_chains_all, [None] * len(complex_names_all), [None] * len(complex_names_all))):
-                    complex_graphs.extend(t[0])
-                    rdkit_ligands.extend(t[1])
-                    pbar.update()
-            with open(os.path.join(self.full_cache_path, "heterographs.pkl"), 'wb') as f:
-                pickle.dump((complex_graphs), f)
-            with open(os.path.join(self.full_cache_path, "rdkit_ligands.pkl"), 'wb') as f:
-                pickle.dump((rdkit_ligands), f)
+            with open(f'{self.full_cache_path}/complex_names.pkl', 'wb') as f:
+                pickle.dump(processed_names, f)
 
     def inference_preprocessing(self):
         ligands_list = []
@@ -310,12 +413,14 @@ class PDBBind(Dataset):
             ligs = read_mols(self.pdbbind_dir, name, remove_hs=False)
         complex_graphs = []
         failed_indices = []
+        complex_names = []
         for i, lig in enumerate(ligs):
             if self.max_lig_size is not None and lig.GetNumHeavyAtoms() > self.max_lig_size:
                 print(f'Ligand with {lig.GetNumHeavyAtoms()} heavy atoms is larger than max_lig_size {self.max_lig_size}. Not including {name} in preprocessed data.')
                 continue
             complex_graph = HeteroData()
             complex_graph['name'] = name
+            
             try:
                 get_lig_graph_with_matching(lig, complex_graph, self.popsize, self.maxiter, self.matching, self.keep_original,
                                             self.num_conformers, remove_hs=self.remove_hs)
@@ -348,9 +453,10 @@ class PDBBind(Dataset):
 
             complex_graph.original_center = protein_center
             complex_graphs.append(complex_graph)
+            complex_names.append(name)
         for idx_to_delete in sorted(failed_indices, reverse=True):
             del ligs[idx_to_delete]
-        return complex_graphs, ligs
+        return complex_graphs, ligs, complex_names
 
 
 def print_statistics(complex_graphs):
